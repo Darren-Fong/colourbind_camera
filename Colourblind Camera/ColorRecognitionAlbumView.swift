@@ -1081,63 +1081,102 @@ class ColorAnalyzer {
         let green = Int(g * 255)
         let blue = Int(b * 255)
         
-        // More accurate color naming logic
-        let brightness = (red + green + blue) / 3
+        // Convert to HSB for more accurate color naming
+        let maxC = max(red, green, blue)
+        let minC = min(red, green, blue)
+        let delta = maxC - minC
         
-        // Check for grayscale first
-        if abs(red - green) < 20 && abs(green - blue) < 20 && abs(red - blue) < 20 {
-            if brightness > 220 { return "White" }
-            if brightness < 50 { return "Black" }
-            return "Gray"
+        let brightness = maxC
+        let saturation = maxC == 0 ? 0 : (delta * 100) / maxC
+        
+        // Calculate hue (0-360)
+        var hue: Int = 0
+        if delta != 0 {
+            if maxC == red {
+                hue = (60 * (green - blue) / delta + 360) % 360
+            } else if maxC == green {
+                hue = 60 * (blue - red) / delta + 120
+            } else {
+                hue = 60 * (red - green) / delta + 240
+            }
         }
         
-        // Find dominant component
-        let maxComponent = max(red, green, blue)
-        let minComponent = min(red, green, blue)
-        let delta = maxComponent - minComponent
-        
-        // Low saturation - desaturated colors
-        if delta < 30 {
-            if brightness > 200 { return "Light Gray" }
-            if brightness < 80 { return "Dark Gray" }
-            return "Gray"
+        // Check for grayscale first (low saturation)
+        if saturation < 12 {
+            if brightness > 230 { return "White" }
+            if brightness > 180 { return "Light Gray" }
+            if brightness > 100 { return "Gray" }
+            if brightness > 50 { return "Dark Gray" }
+            return "Black"
         }
         
-        // Pure colors (high saturation)
-        if red > green + 30 && red > blue + 30 {
-            if green > 100 && blue < 100 { return "Orange" }
-            if green < 100 && blue < 100 { return "Red" }
-            if blue > 100 { return "Pink" }
-            return "Red"
+        // Check for very dark colors
+        if brightness < 30 {
+            return "Black"
         }
         
-        if green > red + 30 && green > blue + 30 {
-            if red > 100 { return "Yellow" }
-            if blue > 100 { return "Cyan" }
-            return "Green"
+        // Check for very light/pale colors
+        if brightness > 220 && saturation < 25 {
+            return "White"
         }
         
-        if blue > red + 30 && blue > green + 30 {
-            if red > 100 { return "Purple" }
-            if green > 100 { return "Cyan" }
-            return "Blue"
+        // Determine color based on hue
+        // Using HSB color wheel: Red=0, Yellow=60, Green=120, Cyan=180, Blue=240, Magenta=300
+        
+        let isLight = brightness > 180
+        let isDark = brightness < 80
+        let isPale = saturation < 35
+        
+        var colorName: String
+        
+        if hue < 15 || hue >= 345 {
+            // Red range
+            if isPale && isLight { colorName = "Pink" }
+            else if isDark { colorName = "Dark Red" }
+            else if red > 180 && green > 100 && green < 180 && blue < 100 { colorName = "Orange" }
+            else { colorName = "Red" }
+        } else if hue < 45 {
+            // Orange range
+            if isDark { colorName = "Brown" }
+            else if isPale { colorName = "Peach" }
+            else { colorName = "Orange" }
+        } else if hue < 70 {
+            // Yellow-Orange range
+            if isDark { colorName = "Brown" }
+            else if brightness < 150 { colorName = "Olive" }
+            else { colorName = "Yellow" }
+        } else if hue < 150 {
+            // Green range
+            if isPale && isLight { colorName = "Light Green" }
+            else if isDark { colorName = "Dark Green" }
+            else if hue > 140 { colorName = "Teal" }
+            else { colorName = "Green" }
+        } else if hue < 190 {
+            // Cyan range
+            if isPale { colorName = "Light Blue" }
+            else { colorName = "Cyan" }
+        } else if hue < 260 {
+            // Blue range
+            if isPale && isLight { colorName = "Light Blue" }
+            else if isDark { colorName = "Navy" }
+            else { colorName = "Blue" }
+        } else if hue < 290 {
+            // Purple range
+            if isPale { colorName = "Lavender" }
+            else if isDark { colorName = "Dark Purple" }
+            else { colorName = "Purple" }
+        } else if hue < 330 {
+            // Magenta/Pink range
+            if isPale && isLight { colorName = "Pink" }
+            else if isDark { colorName = "Maroon" }
+            else { colorName = "Magenta" }
+        } else {
+            // Back to red range
+            if isPale && isLight { colorName = "Pink" }
+            else { colorName = "Red" }
         }
         
-        // Mixed colors (similar components)
-        if red > 180 && green > 180 && blue < 120 { return "Yellow" }
-        if red > 180 && blue > 180 && green < 120 { return "Magenta" }
-        if green > 180 && blue > 180 && red < 120 { return "Cyan" }
-        if red > 150 && green > 100 && green < 180 && blue < 100 { return "Orange" }
-        if red > 100 && green < 80 && blue > 100 { return "Purple" }
-        if red > 100 && green > 50 && blue < 80 { return "Brown" }
-        if red > 200 && green > 150 && blue > 150 { return "Pink" }
-        
-        // Default based on dominant
-        if maxComponent == red { return "Reddish" }
-        if maxComponent == green { return "Greenish" }
-        if maxComponent == blue { return "Bluish" }
-        
-        return "Mixed"
+        return colorName
     }
     
     private func generateTags(from colors: [ColorInfo]) -> [String] {

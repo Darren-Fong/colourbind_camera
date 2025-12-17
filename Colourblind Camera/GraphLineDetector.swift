@@ -58,74 +58,191 @@ class GraphLineDetector {
             
             let ctx = context.cgContext
             
-            // Define different patterns for each line
-            let patterns: [PatternStyle] = [.solid, .dashed, .dotted, .dashDot, .thickDashed]
+            // Define different shape markers for each color group
+            let shapeStyles: [ShapeMarkerStyle] = [.circle, .square, .triangle, .diamond, .cross, .star]
             
-            // Group lines by color
-            let groupedLines = Dictionary(grouping: lines) { line in
+            // Group lines by color - only process significant lines
+            let significantLines = lines.filter { $0.path.count >= 5 && isSignificantLine($0) }
+            
+            let groupedLines = Dictionary(grouping: significantLines) { line in
                 quantizeColor(line.color)
             }
             
-            var patternIndex = 0
+            var shapeIndex = 0
             
-            for (_, colorLines) in groupedLines {
-                let pattern = patterns[patternIndex % patterns.count]
+            for (colorKey, colorLines) in groupedLines {
+                let shape = shapeStyles[shapeIndex % shapeStyles.count]
+                let lineColor = colorLines.first?.color ?? .black
                 
                 for line in colorLines {
-                    drawPatternedLine(
+                    // Draw shape markers along the line path
+                    drawShapeMarkersAlongPath(
                         path: line.path,
-                        pattern: pattern,
-                        thickness: line.thickness,
+                        shape: shape,
+                        color: lineColor,
                         context: ctx
                     )
                 }
                 
-                patternIndex += 1
+                shapeIndex += 1
             }
         }
     }
     
-    private enum PatternStyle {
-        case solid
-        case dashed
-        case dotted
-        case dashDot
-        case thickDashed
+    private func isSignificantLine(_ line: DetectedLine) -> Bool {
+        // Filter out noise - only keep lines with meaningful length
+        guard line.path.count >= 3 else { return false }
+        
+        var totalLength: CGFloat = 0
+        for i in 0..<line.path.count - 1 {
+            let dx = line.path[i+1].x - line.path[i].x
+            let dy = line.path[i+1].y - line.path[i].y
+            totalLength += sqrt(dx*dx + dy*dy)
+        }
+        
+        // Line should be at least 50 pixels long
+        return totalLength >= 50
     }
     
-    private func drawPatternedLine(path: [CGPoint], pattern: PatternStyle, thickness: CGFloat, context: CGContext) {
+    enum ShapeMarkerStyle {
+        case circle
+        case square
+        case triangle
+        case diamond
+        case cross
+        case star
+    }
+    
+    private func drawShapeMarkersAlongPath(path: [CGPoint], shape: ShapeMarkerStyle, color: UIColor, context: CGContext) {
         guard path.count >= 2 else { return }
         
+        // Calculate total path length
+        var totalLength: CGFloat = 0
+        for i in 0..<path.count - 1 {
+            let dx = path[i+1].x - path[i].x
+            let dy = path[i+1].y - path[i].y
+            totalLength += sqrt(dx*dx + dy*dy)
+        }
+        
+        // Place markers every ~40 pixels along the path
+        let markerSpacing: CGFloat = 40
+        let numMarkers = max(3, Int(totalLength / markerSpacing))
+        
+        let markerSize: CGFloat = 12
+        
         context.saveGState()
-        
-        context.setLineWidth(thickness * 1.5) // Make patterns more visible
+        context.setFillColor(color.cgColor)
         context.setStrokeColor(UIColor.black.cgColor)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
+        context.setLineWidth(1.5)
         
-        switch pattern {
-        case .solid:
-            context.setLineDash(phase: 0, lengths: [])
-        case .dashed:
-            context.setLineDash(phase: 0, lengths: [10, 5])
-        case .dotted:
-            context.setLineDash(phase: 0, lengths: [2, 3])
-        case .dashDot:
-            context.setLineDash(phase: 0, lengths: [10, 5, 2, 5])
-        case .thickDashed:
-            context.setLineDash(phase: 0, lengths: [15, 8])
+        for i in 0..<numMarkers {
+            let t = CGFloat(i) / CGFloat(numMarkers - 1)
+            let point = pointAlongPath(path: path, t: t)
+            
+            drawShape(shape, at: point, size: markerSize, context: context)
         }
         
-        // Draw the path
-        context.beginPath()
-        context.move(to: path[0])
-        
-        for i in 1..<path.count {
-            context.addLine(to: path[i])
-        }
-        
-        context.strokePath()
         context.restoreGState()
+    }
+    
+    private func pointAlongPath(path: [CGPoint], t: CGFloat) -> CGPoint {
+        guard path.count >= 2 else { return path.first ?? .zero }
+        
+        let index = Int(t * CGFloat(path.count - 1))
+        let clampedIndex = min(index, path.count - 1)
+        return path[clampedIndex]
+    }
+    
+    private func drawShape(_ shape: ShapeMarkerStyle, at center: CGPoint, size: CGFloat, context: CGContext) {
+        let halfSize = size / 2
+        
+        switch shape {
+        case .circle:
+            let rect = CGRect(x: center.x - halfSize, y: center.y - halfSize, width: size, height: size)
+            context.fillEllipse(in: rect)
+            context.strokeEllipse(in: rect)
+            
+        case .square:
+            let rect = CGRect(x: center.x - halfSize, y: center.y - halfSize, width: size, height: size)
+            context.fill(rect)
+            context.stroke(rect)
+            
+        case .triangle:
+            context.beginPath()
+            context.move(to: CGPoint(x: center.x, y: center.y - halfSize))
+            context.addLine(to: CGPoint(x: center.x - halfSize, y: center.y + halfSize))
+            context.addLine(to: CGPoint(x: center.x + halfSize, y: center.y + halfSize))
+            context.closePath()
+            context.fillPath()
+            context.beginPath()
+            context.move(to: CGPoint(x: center.x, y: center.y - halfSize))
+            context.addLine(to: CGPoint(x: center.x - halfSize, y: center.y + halfSize))
+            context.addLine(to: CGPoint(x: center.x + halfSize, y: center.y + halfSize))
+            context.closePath()
+            context.strokePath()
+            
+        case .diamond:
+            context.beginPath()
+            context.move(to: CGPoint(x: center.x, y: center.y - halfSize))
+            context.addLine(to: CGPoint(x: center.x + halfSize, y: center.y))
+            context.addLine(to: CGPoint(x: center.x, y: center.y + halfSize))
+            context.addLine(to: CGPoint(x: center.x - halfSize, y: center.y))
+            context.closePath()
+            context.fillPath()
+            context.beginPath()
+            context.move(to: CGPoint(x: center.x, y: center.y - halfSize))
+            context.addLine(to: CGPoint(x: center.x + halfSize, y: center.y))
+            context.addLine(to: CGPoint(x: center.x, y: center.y + halfSize))
+            context.addLine(to: CGPoint(x: center.x - halfSize, y: center.y))
+            context.closePath()
+            context.strokePath()
+            
+        case .cross:
+            let armWidth: CGFloat = size / 4
+            context.setLineWidth(armWidth)
+            context.beginPath()
+            context.move(to: CGPoint(x: center.x - halfSize, y: center.y))
+            context.addLine(to: CGPoint(x: center.x + halfSize, y: center.y))
+            context.move(to: CGPoint(x: center.x, y: center.y - halfSize))
+            context.addLine(to: CGPoint(x: center.x, y: center.y + halfSize))
+            context.strokePath()
+            context.setLineWidth(1.5)
+            
+        case .star:
+            let innerRadius = halfSize * 0.4
+            context.beginPath()
+            for i in 0..<10 {
+                let radius = i % 2 == 0 ? halfSize : innerRadius
+                let angle = CGFloat(i) * .pi / 5 - .pi / 2
+                let point = CGPoint(
+                    x: center.x + radius * cos(angle),
+                    y: center.y + radius * sin(angle)
+                )
+                if i == 0 {
+                    context.move(to: point)
+                } else {
+                    context.addLine(to: point)
+                }
+            }
+            context.closePath()
+            context.fillPath()
+            context.beginPath()
+            for i in 0..<10 {
+                let radius = i % 2 == 0 ? halfSize : innerRadius
+                let angle = CGFloat(i) * .pi / 5 - .pi / 2
+                let point = CGPoint(
+                    x: center.x + radius * cos(angle),
+                    y: center.y + radius * sin(angle)
+                )
+                if i == 0 {
+                    context.move(to: point)
+                } else {
+                    context.addLine(to: point)
+                }
+            }
+            context.closePath()
+            context.strokePath()
+        }
     }
     
     private func convertPathToPoints(_ path: CGPath, imageSize: CGSize) -> [CGPoint] {
