@@ -36,6 +36,57 @@ extension UIImage {
                       blue: CGFloat(bitmap[2]) / 255,
                       alpha: CGFloat(bitmap[3]) / 255)
     }
+    
+    // Get dominant color by sampling multiple points and finding most common
+    func getDominantColor() -> UIColor? {
+        guard let cgImage = self.cgImage else { return nil }
+        
+        let width = cgImage.width
+        let height = cgImage.height
+        
+        guard width > 0, height > 0,
+              let pixelData = cgImage.dataProvider?.data,
+              let data = CFDataGetBytePtr(pixelData) else {
+            return nil
+        }
+        
+        let bytesPerPixel = cgImage.bitsPerPixel / 8
+        let bytesPerRow = cgImage.bytesPerRow
+        
+        var rTotal: CGFloat = 0
+        var gTotal: CGFloat = 0
+        var bTotal: CGFloat = 0
+        var sampleCount = 0
+        
+        // Sample a grid of points across the image
+        let sampleSize = 10
+        for row in 0..<sampleSize {
+            for col in 0..<sampleSize {
+                let x = (col * width) / sampleSize
+                let y = (row * height) / sampleSize
+                
+                let pixelOffset = y * bytesPerRow + x * bytesPerPixel
+                
+                let r = CGFloat(data[pixelOffset]) / 255.0
+                let g = CGFloat(data[pixelOffset + 1]) / 255.0
+                let b = CGFloat(data[pixelOffset + 2]) / 255.0
+                
+                rTotal += r
+                gTotal += g
+                bTotal += b
+                sampleCount += 1
+            }
+        }
+        
+        guard sampleCount > 0 else { return nil }
+        
+        return UIColor(
+            red: rTotal / CGFloat(sampleCount),
+            green: gTotal / CGFloat(sampleCount),
+            blue: bTotal / CGFloat(sampleCount),
+            alpha: 1.0
+        )
+    }
 }
 
 extension UIColor {
@@ -277,7 +328,13 @@ class CameraService: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, Obs
     let processingQueue = DispatchQueue(label: "com.colourblind.processing")
     
     @Published var dominantColor: String = "Unknown"
-    @Published var colorBlindnessType: ColorBlindnessType = .normal
+    
+    // Use shared settings instead of local state
+    private var settings = AppSettings.shared
+    var colorBlindnessType: ColorBlindnessType {
+        get { settings.colorBlindnessType }
+        set { settings.colorBlindnessType = newValue }
+    }
     
     func checkPermissions() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -364,24 +421,369 @@ class CameraService: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, Obs
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        if let processedBuffer = DaltonizationFilter.shared.processBuffer(pixelBuffer, type: colorBlindnessType) {
-            let ciImage = CIImage(cvPixelBuffer: processedBuffer)
-            let context = CIContext()
-            
-            let centerRect = CGRect(x: ciImage.extent.width/2 - 50,
-                                  y: ciImage.extent.height/2 - 50,
-                                  width: 100,
-                                  height: 100)
-            
-            guard let centerImage = context.createCGImage(ciImage, from: centerRect) else { return }
-            
-            let uiImage = UIImage(cgImage: centerImage)
-            
-            if let color = uiImage.averageColor {
-                DispatchQueue.main.async {
-                    self.dominantColor = color.closestColorName()
-                }
+        // Lock the buffer for reading
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
+        
+        // Sample center region (larger area for better averaging)
+        let centerX = width / 2
+        let centerY = height / 2
+        let sampleRadius = 80 // Sample a 160x160 pixel area
+        
+        var rTotal: Double = 0
+        var gTotal: Double = 0
+        var bTotal: Double = 0
+        var sampleCount = 0
+        
+        // Sample points in the center region
+        for dy in stride(from: -sampleRadius, to: sampleRadius, by: 8) {
+            for dx in stride(from: -sampleRadius, to: sampleRadius, by: 8) {
+                let x = centerX + dx
+                let y = centerY + dy
+                
+                guard x >= 0, x < width, y >= 0, y < height else { continue }
+                
+                // BGRA format (most common for camera)
+                let pixelOffset = y * bytesPerRow + x * 4
+                let b = Double(buffer[pixelOffset]) / 255.0
+                let g = Double(buffer[pixelOffset + 1]) / 255.0
+                let r = Double(buffer[pixelOffset + 2]) / 255.0
+                
+                rTotal += r
+                gTotal += g
+                bTotal += b
+                sampleCount += 1
             }
         }
+        
+        guard sampleCount > 0 else { return }
+        
+        let avgR = rTotal / Double(sampleCount)
+        let avgG = gTotal / Double(sampleCount)
+        let avgB = bTotal / Double(sampleCount)
+        
+        // Get color name with advanced algorithm
+        let colorName = ColorRecognizer.shared.recognizeColor(r: avgR, g: avgG, b: avgB)
+        
+        DispatchQueue.main.async {
+            self.dominantColor = colorName
+        }
+    }
+}
+
+// MARK: - Advanced Color Recognizer
+class ColorRecognizer {
+    static let shared = ColorRecognizer()
+    
+    // Adaptive white balance reference (updated over time)
+    private var whiteBalanceR: Double = 1.0
+    private var whiteBalanceG: Double = 1.0
+    private var whiteBalanceB: Double = 1.0
+    private var sampleHistory: [(r: Double, g: Double, b: Double)] = []
+    private let maxHistorySize = 30
+    
+    func recognizeColor(r: Double, g: Double, b: Double) -> String {
+        // Update sample history for adaptive white balance
+        updateSampleHistory(r: r, g: g, b: b)
+        
+        // Apply white balance correction
+        let (corrR, corrG, corrB) = applyWhiteBalance(r: r, g: g, b: b)
+        
+        // Convert to HSL
+        let (hue, saturation, lightness) = rgbToHSL(r: corrR, g: corrG, b: corrB)
+        
+        // Also calculate chroma for better detection
+        let maxRGB = max(corrR, corrG, corrB)
+        let minRGB = min(corrR, corrG, corrB)
+        let chroma = maxRGB - minRGB
+        
+        // Convert to degrees and percentages
+        let h = hue * 360
+        let s = saturation * 100
+        let l = lightness * 100
+        
+        // Detect grayscale - use chroma and saturation together
+        let isNeutral = chroma < 0.12 && s < 15
+        
+        if isNeutral {
+            return classifyGrayscale(lightness: l)
+        }
+        
+        // Classify chromatic colors
+        return classifyChromatic(hue: h, saturation: s, lightness: l, chroma: chroma)
+    }
+    
+    private func updateSampleHistory(r: Double, g: Double, b: Double) {
+        sampleHistory.append((r: r, g: g, b: b))
+        if sampleHistory.count > maxHistorySize {
+            sampleHistory.removeFirst()
+        }
+        
+        // Update white balance based on history (gray world assumption)
+        if sampleHistory.count >= 10 {
+            let avgR = sampleHistory.map { $0.r }.reduce(0, +) / Double(sampleHistory.count)
+            let avgG = sampleHistory.map { $0.g }.reduce(0, +) / Double(sampleHistory.count)
+            let avgB = sampleHistory.map { $0.b }.reduce(0, +) / Double(sampleHistory.count)
+            
+            let grayTarget = (avgR + avgG + avgB) / 3.0
+            
+            if grayTarget > 0.05 {
+                // Smoothly adjust white balance
+                let smoothing = 0.1
+                whiteBalanceR = whiteBalanceR * (1 - smoothing) + (grayTarget / max(avgR, 0.01)) * smoothing
+                whiteBalanceG = whiteBalanceG * (1 - smoothing) + (grayTarget / max(avgG, 0.01)) * smoothing
+                whiteBalanceB = whiteBalanceB * (1 - smoothing) + (grayTarget / max(avgB, 0.01)) * smoothing
+                
+                // Clamp to reasonable range
+                whiteBalanceR = max(0.5, min(2.0, whiteBalanceR))
+                whiteBalanceG = max(0.5, min(2.0, whiteBalanceG))
+                whiteBalanceB = max(0.5, min(2.0, whiteBalanceB))
+            }
+        }
+    }
+    
+    private func applyWhiteBalance(r: Double, g: Double, b: Double) -> (Double, Double, Double) {
+        let corrR = min(1.0, r * whiteBalanceR)
+        let corrG = min(1.0, g * whiteBalanceG)
+        let corrB = min(1.0, b * whiteBalanceB)
+        return (corrR, corrG, corrB)
+    }
+    
+    private func rgbToHSL(r: Double, g: Double, b: Double) -> (h: Double, s: Double, l: Double) {
+        let maxC = max(r, g, b)
+        let minC = min(r, g, b)
+        let delta = maxC - minC
+        
+        let l = (maxC + minC) / 2.0
+        
+        var s: Double = 0
+        if delta > 0.001 {
+            s = delta / (1 - abs(2 * l - 1))
+            s = min(1.0, max(0, s))
+        }
+        
+        var h: Double = 0
+        if delta > 0.001 {
+            if maxC == r {
+                h = ((g - b) / delta).truncatingRemainder(dividingBy: 6)
+            } else if maxC == g {
+                h = (b - r) / delta + 2
+            } else {
+                h = (r - g) / delta + 4
+            }
+            h /= 6
+            if h < 0 { h += 1 }
+        }
+        
+        return (h, s, l)
+    }
+    
+    private func classifyGrayscale(lightness: Double) -> String {
+        if lightness > 92 { return "White" }
+        if lightness > 78 { return "Off-White" }
+        if lightness > 65 { return "Light Gray" }
+        if lightness > 45 { return "Gray" }
+        if lightness > 28 { return "Dark Gray" }
+        if lightness > 12 { return "Charcoal" }
+        return "Black"
+    }
+    
+    private func classifyChromatic(hue: Double, saturation: Double, lightness: Double, chroma: Double) -> String {
+        // Lightness classifications
+        let isVeryLight = lightness > 80
+        let isLight = lightness > 62
+        let isMediumLight = lightness > 45
+        let isMedium = lightness > 32
+        let isDark = lightness < 32
+        let isVeryDark = lightness < 20
+        
+        // Saturation classifications
+        let isVeryPale = saturation < 20
+        let isPale = saturation < 35
+        let isMuted = saturation < 50
+        let isVivid = saturation > 70
+        let isVeryVivid = saturation > 85
+        
+        // Hue-based classification with detailed ranges
+        
+        // RED (345-360, 0-10)
+        if hue >= 345 || hue < 10 {
+            if isVeryLight && isVeryPale { return "White-Pink" }
+            if isVeryLight { return "Light Pink" }
+            if isLight && isPale { return "Rose" }
+            if isLight && isMuted { return "Salmon" }
+            if isLight { return "Coral" }
+            if isVeryDark { return "Dark Red" }
+            if isDark && isMuted { return "Maroon" }
+            if isDark { return "Burgundy" }
+            if isVeryVivid { return "Bright Red" }
+            if isVivid { return "Red" }
+            if isMuted { return "Brick Red" }
+            return "Red"
+        }
+        
+        // RED-ORANGE (10-25)
+        if hue < 25 {
+            if isVeryDark { return "Brown" }
+            if isDark { return "Dark Brown" }
+            if isVeryLight && isPale { return "Peach" }
+            if isVeryLight { return "Light Coral" }
+            if isLight { return "Coral" }
+            if isMuted { return "Rust" }
+            return "Red-Orange"
+        }
+        
+        // ORANGE (25-42)
+        if hue < 42 {
+            if isVeryDark { return "Dark Brown" }
+            if isDark && isMuted { return "Brown" }
+            if isDark { return "Burnt Orange" }
+            if isVeryLight && isVeryPale { return "Cream" }
+            if isVeryLight { return "Peach" }
+            if isLight && isPale { return "Apricot" }
+            if isLight { return "Light Orange" }
+            if isPale { return "Tan" }
+            if isVeryVivid { return "Bright Orange" }
+            return "Orange"
+        }
+        
+        // GOLD/YELLOW-ORANGE (42-52)
+        if hue < 52 {
+            if isVeryDark { return "Brown" }
+            if isDark { return "Olive Brown" }
+            if isVeryLight && isPale { return "Cream" }
+            if isVeryLight { return "Light Gold" }
+            if isPale { return "Khaki" }
+            if isVivid { return "Gold" }
+            return "Golden Yellow"
+        }
+        
+        // YELLOW (52-68)
+        if hue < 68 {
+            if isVeryDark { return "Olive" }
+            if isDark { return "Dark Olive" }
+            if isVeryLight && isVeryPale { return "Ivory" }
+            if isVeryLight { return "Light Yellow" }
+            if isPale && isLight { return "Cream" }
+            if isPale { return "Beige" }
+            if isVeryVivid { return "Bright Yellow" }
+            if isVivid { return "Yellow" }
+            if isMuted { return "Mustard" }
+            return "Yellow"
+        }
+        
+        // YELLOW-GREEN (68-85)
+        if hue < 85 {
+            if isVeryDark { return "Dark Olive" }
+            if isDark { return "Olive" }
+            if isVeryLight { return "Light Lime" }
+            if isPale { return "Pale Green" }
+            if isVivid { return "Lime" }
+            return "Yellow-Green"
+        }
+        
+        // GREEN (85-155)
+        if hue < 155 {
+            if isVeryLight && isVeryPale { return "Mint" }
+            if isVeryLight && isPale { return "Pale Mint" }
+            if isVeryLight { return "Light Green" }
+            if isLight && isPale { return "Sage" }
+            if isLight { return "Spring Green" }
+            if isVeryDark { return "Dark Green" }
+            if isDark && isMuted { return "Forest Green" }
+            if isDark { return "Hunter Green" }
+            if isVeryVivid { return "Bright Green" }
+            if isVivid { return "Green" }
+            if isMuted { return "Olive Green" }
+            if hue > 140 && isMedium { return "Teal Green" }
+            return "Green"
+        }
+        
+        // CYAN-GREEN (155-175)
+        if hue < 175 {
+            if isVeryLight { return "Aqua" }
+            if isLight { return "Seafoam" }
+            if isDark { return "Dark Teal" }
+            if isVivid { return "Turquoise" }
+            return "Teal"
+        }
+        
+        // CYAN (175-195)
+        if hue < 195 {
+            if isVeryLight { return "Light Cyan" }
+            if isLight { return "Sky Blue" }
+            if isDark { return "Dark Cyan" }
+            if isVeryVivid { return "Bright Cyan" }
+            return "Cyan"
+        }
+        
+        // LIGHT BLUE (195-215)
+        if hue < 215 {
+            if isVeryLight && isVeryPale { return "Ice Blue" }
+            if isVeryLight { return "Powder Blue" }
+            if isLight { return "Sky Blue" }
+            if isDark { return "Steel Blue" }
+            return "Light Blue"
+        }
+        
+        // BLUE (215-250)
+        if hue < 250 {
+            if isVeryLight && isVeryPale { return "Periwinkle" }
+            if isVeryLight { return "Light Blue" }
+            if isLight && isPale { return "Cornflower Blue" }
+            if isLight { return "Medium Blue" }
+            if isVeryDark { return "Navy" }
+            if isDark { return "Dark Blue" }
+            if isVeryVivid { return "Bright Blue" }
+            if isVivid { return "Blue" }
+            if isMuted { return "Slate Blue" }
+            return "Blue"
+        }
+        
+        // BLUE-PURPLE (250-275)
+        if hue < 275 {
+            if isVeryLight { return "Lavender" }
+            if isLight { return "Periwinkle" }
+            if isDark { return "Indigo" }
+            if isVivid { return "Violet" }
+            return "Blue-Violet"
+        }
+        
+        // PURPLE (275-310)
+        if hue < 310 {
+            if isVeryLight && isVeryPale { return "Pale Lavender" }
+            if isVeryLight { return "Light Purple" }
+            if isLight && isPale { return "Lilac" }
+            if isLight { return "Orchid" }
+            if isVeryDark { return "Dark Purple" }
+            if isDark { return "Plum" }
+            if isVeryVivid { return "Bright Purple" }
+            if isVivid { return "Purple" }
+            if isMuted { return "Mauve" }
+            return "Purple"
+        }
+        
+        // MAGENTA/PINK (310-345)
+        if hue < 345 {
+            if isVeryLight && isVeryPale { return "Blush" }
+            if isVeryLight { return "Light Pink" }
+            if isLight && isPale { return "Rose Pink" }
+            if isLight { return "Pink" }
+            if isDark && isMuted { return "Plum" }
+            if isDark { return "Magenta" }
+            if isVeryVivid { return "Hot Pink" }
+            if isVivid { return "Fuchsia" }
+            if isMuted { return "Dusty Rose" }
+            return "Magenta"
+        }
+        
+        return "Unknown"
     }
 }

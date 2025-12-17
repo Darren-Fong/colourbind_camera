@@ -3,7 +3,7 @@ import AVFoundation
 
 struct LiveColorView: View {
     @StateObject private var cameraService = CameraService()
-    @State private var selectedFilter = "Normal"
+    @ObservedObject private var settings = AppSettings.shared
     @State private var showFilterSettings = false
     @State private var showColorText = true
     @State private var cameraPermissionDenied = false
@@ -15,6 +15,15 @@ struct LiveColorView: View {
         "Protanopia": (color: Color("Protanopia"), opacity: 0.3),
         "Trianopia": (color: Color("Trianopia"), opacity: 0.3)
     ]
+    
+    private var selectedFilter: String {
+        switch settings.colorBlindnessType {
+        case .normal: return "Normal"
+        case .protanopia: return "Protanopia"
+        case .deuteranopia: return "Deuteranopia"
+        case .tritanopia: return "Trianopia"
+        }
+    }
     
     var body: some View {
         NavigationView {
@@ -135,7 +144,7 @@ struct LiveColorView: View {
             }
             .navigationBarHidden(true)
             .sheet(isPresented: $showFilterSettings) {
-                FilterSettingsView(selectedFilter: $selectedFilter)
+                FilterSettingsView()
             }
             .onAppear {
                 startCamera()
@@ -168,28 +177,29 @@ struct LiveColorView: View {
 }
 
 struct FilterSettingsView: View {
-    @Binding var selectedFilter: String
+    @ObservedObject private var settings = AppSettings.shared
     @Environment(\.presentationMode) var presentationMode
     
-    let filters = [
-        (name: "Normal", description: "No color adjustment"),
-        (name: "Deuteranopia", description: "For red-green color blindness (green weak)"),
-        (name: "Protanopia", description: "For red-green color blindness (red weak)"),
-        (name: "Trianopia", description: "For blue-yellow color blindness")
+    let filters: [(type: ColorBlindnessType, description: String)] = [
+        (.normal, "No color adjustment"),
+        (.protanopia, "For red-green color blindness (red weak)"),
+        (.deuteranopia, "For red-green color blindness (green weak)"),
+        (.tritanopia, "For blue-yellow color blindness")
     ]
     
     var body: some View {
         NavigationView {
             List {
-                ForEach(filters, id: \.name) { filter in
+                ForEach(filters, id: \.type) { filter in
                     Button(action: {
-                        selectedFilter = filter.name
+                        settings.colorBlindnessType = filter.type
                         presentationMode.wrappedValue.dismiss()
                     }) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(filter.name)
+                                Text(filter.type.displayName)
                                     .font(.headline)
+                                    .foregroundColor(.primary)
                                 Text(filter.description)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
@@ -197,7 +207,7 @@ struct FilterSettingsView: View {
                             
                             Spacer()
                             
-                            if selectedFilter == filter.name {
+                            if settings.colorBlindnessType == filter.type {
                                 Image(systemName: "checkmark")
                                     .foregroundColor(.blue)
                             }

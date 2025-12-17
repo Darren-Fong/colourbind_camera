@@ -130,7 +130,7 @@ struct ColorIdentificationView: View {
             ColorIdentificationHelpView()
         }
         .sheet(isPresented: $showingColorSettings) {
-            ColorSettingsView(colorBlindnessType: $cameraService.colorBlindnessType)
+            ColorSettingsView()
         }
         .onAppear {
             cameraService.checkPermissions()

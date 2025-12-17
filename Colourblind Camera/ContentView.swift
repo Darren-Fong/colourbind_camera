@@ -139,44 +139,87 @@ struct FeatureCard: View {
     }
 }
 
-// Placeholder views for settings and help
+// Settings View
 struct SettingsView: View {
-    @AppStorage("largeText") private var largeText = false
-    @AppStorage("highContrast") private var highContrast = false
-    @AppStorage("voiceAnnouncements") private var voiceAnnouncements = true
-    @AppStorage("hapticFeedback") private var hapticFeedback = true
-    @AppStorage("colorCorrection") private var colorCorrection = true
-    @AppStorage("enhancedContrast") private var enhancedContrast = false
-    @AppStorage("analytics") private var analytics = false
+    @ObservedObject private var settings = AppSettings.shared
+    @State private var showResetAlert = false
+    @State private var showClearDataAlert = false
     
     var body: some View {
         Form {
-            Section("Appearance") {
-                Toggle("Large Text", isOn: $largeText)
-                Toggle("High Contrast", isOn: $highContrast)
+            Section(header: Text("Color Vision")) {
+                Picker("Color Blindness Type", selection: $settings.colorBlindnessType) {
+                    Text("Normal Vision").tag(ColorBlindnessType.normal)
+                    Text("Protanopia (Red-blind)").tag(ColorBlindnessType.protanopia)
+                    Text("Deuteranopia (Green-blind)").tag(ColorBlindnessType.deuteranopia)
+                    Text("Tritanopia (Blue-blind)").tag(ColorBlindnessType.tritanopia)
+                }
+                .pickerStyle(.navigationLink)
+                
+                Toggle("Color Correction", isOn: $settings.colorCorrection)
+                Toggle("Enhanced Contrast", isOn: $settings.enhancedContrast)
             }
             
-            Section("Accessibility") {
-                Toggle("Voice Announcements", isOn: $voiceAnnouncements)
-                Toggle("Haptic Feedback", isOn: $hapticFeedback)
+            Section(header: Text("Appearance")) {
+                Toggle("Large Text", isOn: $settings.largeText)
+                Toggle("High Contrast", isOn: $settings.highContrast)
             }
             
-            Section("Color Vision") {
-                Toggle("Color Correction", isOn: $colorCorrection)
-                Toggle("Enhanced Contrast", isOn: $enhancedContrast)
+            Section(header: Text("Accessibility")) {
+                Toggle("Voice Announcements", isOn: $settings.voiceAnnouncements)
+                Toggle("Haptic Feedback", isOn: $settings.hapticFeedback)
             }
             
-            Section("Privacy") {
-                Toggle("Analytics", isOn: $analytics)
-                Button("Clear Data") {
-                    // Clear user data
-                    ColorAlbumManager.shared.clearAllImages()
+            Section(header: Text("Camera")) {
+                Toggle("Auto White Balance", isOn: $settings.autoWhiteBalance)
+                Toggle("Advanced Color Recognition", isOn: $settings.advancedColorRecognition)
+            }
+            
+            Section(header: Text("Privacy")) {
+                Toggle("Analytics", isOn: $settings.analytics)
+                
+                Button(action: {
+                    showClearDataAlert = true
+                }) {
+                    HStack {
+                        Text("Clear Data")
+                        Spacer()
+                    }
                 }
                 .foregroundColor(.red)
+            }
+            
+            Section {
+                Button(action: {
+                    showResetAlert = true
+                }) {
+                    HStack {
+                        Spacer()
+                        Text("Reset All Settings")
+                        Spacer()
+                    }
+                }
+                .foregroundColor(.orange)
             }
         }
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.large)
+        .alert("Reset All Settings", isPresented: $showResetAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset", role: .destructive) {
+                settings.resetToDefaults()
+            }
+        } message: {
+            Text("This will reset all settings to their default values. This action cannot be undone.")
+        }
+        .alert("Clear Data", isPresented: $showClearDataAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear", role: .destructive) {
+                settings.clearAllData()
+            }
+        } message: {
+            Text("This will delete all saved photos from the album. This action cannot be undone.")
+        }
     }
 }
 

@@ -2,13 +2,13 @@ import SwiftUI
 
 struct ColorSettingsView: View {
     @Environment(\.presentationMode) var presentationMode
-    @Binding var colorBlindnessType: ColorBlindnessType
+    @ObservedObject private var settings = AppSettings.shared
     
     var body: some View {
         NavigationView {
             Form {
                 Section(header: Text("Color Vision Type")) {
-                    Picker("Color Vision", selection: $colorBlindnessType) {
+                    Picker("Color Vision", selection: $settings.colorBlindnessType) {
                         Text("Normal").tag(ColorBlindnessType.normal)
                         Text("Protanopia").tag(ColorBlindnessType.protanopia)
                         Text("Deuteranopia").tag(ColorBlindnessType.deuteranopia)

@@ -1077,6 +1077,11 @@ class ColorAnalyzer {
     }
     
     private func getColorName(r: CGFloat, g: CGFloat, b: CGFloat) -> String {
+        // Use the same advanced color recognizer as the live camera
+        return ColorRecognizer.shared.recognizeColor(r: Double(r), g: Double(g), b: Double(b))
+        
+        // Old implementation below (kept for reference but not used)
+        /*
         // Apply lighting compensation - normalize based on gray world assumption
         let (normR, normG, normB) = normalizeForLighting(r: r, g: g, b: b)
         
@@ -1180,61 +1185,7 @@ class ColorAnalyzer {
         }
         
         return colorName
-    }
-    
-    // Normalize RGB values to compensate for lighting conditions
-    private func normalizeForLighting(r: CGFloat, g: CGFloat, b: CGFloat) -> (CGFloat, CGFloat, CGFloat) {
-        let luminance = 0.299 * r + 0.587 * g + 0.114 * b
-        
-        if luminance < 0.01 {
-            return (r, g, b)
-        }
-        
-        let avgColor = (r + g + b) / 3.0
-        
-        if avgColor > 0.05 {
-            let scaleR = avgColor / max(r, 0.01)
-            let scaleG = avgColor / max(g, 0.01)
-            let scaleB = avgColor / max(b, 0.01)
-            
-            let blendFactor: CGFloat = 0.4
-            let normR = min(1.0, r * (1 + (scaleR - 1) * blendFactor))
-            let normG = min(1.0, g * (1 + (scaleG - 1) * blendFactor))
-            let normB = min(1.0, b * (1 + (scaleB - 1) * blendFactor))
-            
-            return (normR, normG, normB)
-        }
-        
-        return (r, g, b)
-    }
-    
-    // Convert RGB to HSL
-    private func rgbToHSL(r: CGFloat, g: CGFloat, b: CGFloat) -> (h: CGFloat, s: CGFloat, l: CGFloat) {
-        let maxC = max(r, g, b)
-        let minC = min(r, g, b)
-        let delta = maxC - minC
-        
-        let l = (maxC + minC) / 2.0
-        
-        var s: CGFloat = 0
-        if delta > 0 {
-            s = delta / (1 - abs(2 * l - 1))
-        }
-        
-        var h: CGFloat = 0
-        if delta > 0 {
-            if maxC == r {
-                h = ((g - b) / delta).truncatingRemainder(dividingBy: 6)
-            } else if maxC == g {
-                h = (b - r) / delta + 2
-            } else {
-                h = (r - g) / delta + 4
-            }
-            h /= 6
-            if h < 0 { h += 1 }
-        }
-        
-        return (h, min(1, max(0, s)), l)
+        */
     }
     
     private func generateTags(from colors: [ColorInfo]) -> [String] {
