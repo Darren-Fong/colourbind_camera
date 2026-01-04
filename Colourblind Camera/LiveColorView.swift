@@ -6,6 +6,7 @@ struct LiveColorView: View {
     @ObservedObject private var settings = AppSettings.shared
     @State private var showFilterSettings = false
     @State private var showColorText = true
+    @State private var showObjectRecognition = false
     @State private var cameraPermissionDenied = false
     private let speechSynthesizer = AVSpeechSynthesizer()
     
@@ -94,6 +95,21 @@ struct LiveColorView: View {
                         
                         Spacer()
                         
+                        // Object Recognition Toggle
+                        Button(action: {
+                            withAnimation {
+                                showObjectRecognition.toggle()
+                                cameraService.isObjectRecognitionEnabled = showObjectRecognition
+                            }
+                        }) {
+                            Image(systemName: showObjectRecognition ? "viewfinder.circle.fill" : "viewfinder.circle")
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(Color.black.opacity(0.6))
+                                .foregroundColor(showObjectRecognition ? .green : .white)
+                                .cornerRadius(20)
+                        }
+                        
                         // Color Tag Overlay Button
                         NavigationLink(destination: ColorTagOverlayView(cameraService: cameraService)) {
                             Image(systemName: "tag.fill")
@@ -117,29 +133,95 @@ struct LiveColorView: View {
                                 .foregroundColor(.white)
                                 .cornerRadius(20)
                         }
+                        
+                        // Vision/Algorithm Toggle
+                        Button(action: {
+                            withAnimation {
+                                cameraService.useVisionColorDetection.toggle()
+                            }
+                        }) {
+                            Image(systemName: cameraService.useVisionColorDetection ? "cpu.fill" : "function")
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(Color.black.opacity(0.6))
+                                .foregroundColor(cameraService.useVisionColorDetection ? .blue : .purple)
+                                .cornerRadius(20)
+                        }
                     }
                     .padding()
                     
                     Spacer()
                     
-                    // Color Display
-                    if showColorText {
-                        VStack(spacing: 8) {
-                            Text("Current Color")
-                                .font(.headline)
-                                .foregroundColor(.white)
-                            
-                            Text(cameraService.dominantColor)
-                                .font(.system(size: 32, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 10)
-                                .background(Color.black.opacity(0.6))
-                                .cornerRadius(15)
+                    // Information Display
+                    VStack(spacing: 16) {
+                        // Color Display
+                        if showColorText {
+                            VStack(spacing: 8) {
+                                HStack(spacing: 6) {
+                                    Text("Current Color")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    
+                                    // Mode indicator
+                                    HStack(spacing: 4) {
+                                        Image(systemName: cameraService.useVisionColorDetection ? "cpu" : "function")
+                                            .font(.caption2)
+                                        Text(cameraService.useVisionColorDetection ? "Vision" : "Algorithm")
+                                            .font(.caption2)
+                                    }
+                                    .foregroundColor(.white.opacity(0.6))
+                                }
+                                
+                                Text(cameraService.dominantColor)
+                                    .font(.system(size: 32, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 20)
+                                    .padding(.vertical, 10)
+                                    .background(Color.black.opacity(0.6))
+                                    .cornerRadius(15)
+                            }
+                            .transition(.move(edge: .bottom))
                         }
-                        .padding(.bottom, 40)
-                        .transition(.move(edge: .bottom))
+                        
+                        // Object Recognition Display
+                        if showObjectRecognition && !cameraService.recognizedObject.isEmpty {
+                            VStack(spacing: 8) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "sparkles")
+                                        .font(.caption)
+                                    Text("AI Detection")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.white.opacity(0.8))
+                                
+                                Text(cameraService.recognizedObject)
+                                    .font(.system(size: 24, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .multilineTextAlignment(.center)
+                                
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(cameraService.objectConfidence > 70 ? Color.green : cameraService.objectConfidence > 40 ? Color.orange : Color.yellow)
+                                        .frame(width: 6, height: 6)
+                                    Text("\(cameraService.objectConfidence)% confident")
+                                        .font(.caption2)
+                                        .foregroundColor(.white.opacity(0.9))
+                                }
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 12)
+                            .background(
+                                RoundedRectangle(cornerRadius: 15)
+                                    .fill(Color.purple.opacity(0.7))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 15)
+                                            .stroke(Color.white.opacity(0.3), lineWidth: 1)
+                                    )
+                            )
+                            .transition(.scale.combined(with: .opacity))
+                        }
                     }
+                    .padding(.bottom, 40)
                 }
             }
             .navigationBarHidden(true)
@@ -148,6 +230,10 @@ struct LiveColorView: View {
             }
             .onAppear {
                 startCamera()
+            }
+            .onDisappear {
+                // Stop camera to prevent lag when switching tabs
+                cameraService.stopSession()
             }
         }
     }

@@ -12,11 +12,7 @@ class AppSettings: ObservableObject {
     
     // MARK: - Color Vision Settings
     @AppStorage("colorBlindnessType") private var colorBlindnessTypeRaw: String = ColorBlindnessType.normal.rawValue
-    @Published var colorBlindnessType: ColorBlindnessType {
-        didSet {
-            colorBlindnessTypeRaw = colorBlindnessType.rawValue
-        }
-    }
+    @Published var colorBlindnessType: ColorBlindnessType = .normal
     
     // MARK: - Appearance Settings
     @AppStorage("largeText") var largeText = false
@@ -41,10 +37,19 @@ class AppSettings: ObservableObject {
         // Load the saved color blindness type
         if let savedType = ColorBlindnessType(rawValue: colorBlindnessTypeRaw) {
             colorBlindnessType = savedType
-        } else {
-            colorBlindnessType = .normal
         }
+        
+        // Observe changes to sync with AppStorage
+        setupColorBlindnessTypeObserver()
     }
+    
+    private func setupColorBlindnessTypeObserver() {
+        $colorBlindnessType.sink { [weak self] newValue in
+            self?.colorBlindnessTypeRaw = newValue.rawValue
+        }.store(in: &cancellables)
+    }
+    
+    private var cancellables = Set<AnyCancellable>()
     
     /// Clear all user data
     func clearAllData() {

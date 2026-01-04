@@ -8,6 +8,8 @@ import SwiftUI
 import Foundation
 import AVFoundation
 import CoreImage
+import Vision
+import CoreML
 
 extension UIImage {
     var averageColor: UIColor? {
@@ -320,21 +322,62 @@ extension UIColor {
 
 class CameraService: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, ObservableObject {
     @Published var session: AVCaptureSession?
-    var delegate: AVCapturePhotoCaptureDelegate?
-    
-    let output = AVCapturePhotoOutput()
-    let previewLayer = AVCaptureVideoPreviewLayer()
-    let videoOutput = AVCaptureVideoDataOutput()
-    let processingQueue = DispatchQueue(label: "com.colourblind.processing")
-    
     @Published var dominantColor: String = "Unknown"
+    @Published var recognizedObject: String = ""
+    @Published var objectConfidence: Int = 0
+    @Published var isObjectRecognitionEnabled: Bool = false {
+        didSet {
+            if !isObjectRecognitionEnabled {
+                // Clear object recognition when disabled
+                DispatchQueue.main.async {
+                    self.recognizedObject = ""
+                    self.objectConfidence = 0
+                }
+            }
+        }
+    }
+    @Published var useVisionColorDetection: Bool = false // Default to algorithmic (faster)
     
-    // Use shared settings instead of local state
+    var delegate: AVCapturePhotoCaptureDelegate?
+    private let output = AVCapturePhotoOutput()
+    private let previewLayer = AVCaptureVideoPreviewLayer()
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let processingQueue = DispatchQueue(label: "com.colourblind.processing", qos: .userInitiated)
+    
+    // Lazy loading for ML models
+    private lazy var objectRecognitionModel: VNCoreMLModel? = {
+        guard #available(iOS 17.0, *) else { return nil }
+        do {
+            let config = MLModelConfiguration()
+            config.computeUnits = .cpuAndNeuralEngine // Use Neural Engine when available
+            return try VNCoreMLModel(for: MobileNetV2(configuration: config).model)
+        } catch {
+            print("Failed to load object recognition model: \(error)")
+            return nil
+        }
+    }()
+    
+    // Throttling
+    private var lastProcessTime: Date = Date.distantPast
+    private let minProcessInterval: TimeInterval = 0.15 // Process max 6-7 times per second
+    private var isProcessing = false
+    
+    // Settings
     private var settings = AppSettings.shared
     var colorBlindnessType: ColorBlindnessType {
         get { settings.colorBlindnessType }
         set { settings.colorBlindnessType = newValue }
     }
+    
+    override init() {
+        super.init()
+    }
+    
+    deinit {
+        stopSession()
+    }
+    
+    // MARK: - Session Management
     
     func checkPermissions() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -362,66 +405,131 @@ class CameraService: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, Obs
     
     private func checkPermission(completion: @escaping(Error?)->()) {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
-            case .notDetermined:
-                AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                    guard granted else { return }
-                    DispatchQueue.main.async {
-                        self?.setupCamera(completion: completion)
-                    }
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                guard granted else { return }
+                DispatchQueue.main.async {
+                    self?.setupCamera(completion: completion)
                 }
-            case .restricted:
-                break
-            case .denied:
-                break
-            case .authorized:
-                setupCamera(completion: completion)
-            @unknown default:
-                break
+            }
+        case .restricted, .denied:
+            break
+        case .authorized:
+            setupCamera(completion: completion)
+        @unknown default:
+            break
         }
     }
     
     private func setupCamera(completion: @escaping(Error?)->()) {
-        let session = AVCaptureSession()
-        if let device = AVCaptureDevice.default(for: .video) {
-            do {
-                let input = try AVCaptureDeviceInput(device: device)
-                if session.canAddInput(input) {
-                    session.addInput(input)
+        // Avoid duplicate sessions
+        guard session == nil || session?.isRunning == false else {
+            completion(nil)
+            return
+        }
+        
+        let newSession = AVCaptureSession()
+        newSession.beginConfiguration()
+        newSession.sessionPreset = .high // Balance quality and performance
+        
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            completion(NSError(domain: "CameraService", code: -1, userInfo: [NSLocalizedDescriptionKey: "No camera available"]))
+            return
+        }
+        
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            
+            if newSession.canAddInput(input) {
+                newSession.addInput(input)
+            }
+            
+            if newSession.canAddOutput(output) {
+                newSession.addOutput(output)
+            }
+            
+            // Configure video output for efficient processing
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.setSampleBufferDelegate(self, queue: processingQueue)
+            
+            if newSession.canAddOutput(videoOutput) {
+                newSession.addOutput(videoOutput)
+            }
+            
+            // Set video orientation
+            if let connection = videoOutput.connection(with: .video) {
+                if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
                 }
-                
-                if session.canAddOutput(output) {
-                    session.addOutput(output)
+            }
+            
+            previewLayer.videoGravity = .resizeAspectFill
+            previewLayer.session = newSession
+            
+            newSession.commitConfiguration()
+            
+            // Start session on background thread
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                newSession.startRunning()
+                DispatchQueue.main.async {
+                    self?.session = newSession
+                    completion(nil)
                 }
-                
-                videoOutput.setSampleBufferDelegate(self, queue: processingQueue)
-                if session.canAddOutput(videoOutput) {
-                    session.addOutput(videoOutput)
-                }
-                
-                previewLayer.videoGravity = .resizeAspectFill
-                previewLayer.session = session
-                
-                DispatchQueue.global(qos: .userInitiated).async {
-                    session.startRunning()
-                    DispatchQueue.main.async {
-                        self.session = session
-                        completion(nil)
-                    }
-                }
-            } catch {
-                completion(error)
+            }
+        } catch {
+            completion(error)
+        }
+    }
+    
+    func stopSession() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.session?.stopRunning()
+            DispatchQueue.main.async {
+                self?.session = nil
             }
         }
     }
     
     func capturePhoto(with settings: AVCapturePhotoSettings = AVCapturePhotoSettings()) {
-        output.capturePhoto(with: settings, delegate: delegate!)
+        guard let delegate = delegate else { return }
+        output.capturePhoto(with: settings, delegate: delegate)
     }
     
+    // MARK: - Video Frame Processing
+    
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // Throttle processing to prevent lag
+        let now = Date()
+        guard now.timeIntervalSince(lastProcessTime) >= minProcessInterval else { return }
+        guard !isProcessing else { return }
+        
+        isProcessing = true
+        lastProcessTime = now
+        
+        defer { isProcessing = false }
+        
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        // Lock the buffer for reading
+        // Process color detection (lightweight, always runs)
+        processColorDetection(pixelBuffer: pixelBuffer)
+        
+        // Process object recognition only if enabled (heavier)
+        if isObjectRecognitionEnabled {
+            processObjectRecognition(pixelBuffer: pixelBuffer)
+        }
+    }
+    
+    // MARK: - Color Detection
+    
+    private func processColorDetection(pixelBuffer: CVPixelBuffer) {
+        if useVisionColorDetection {
+            performVisionColorDetection(on: pixelBuffer)
+        } else {
+            performFastColorDetection(on: pixelBuffer)
+        }
+    }
+    
+    private func performFastColorDetection(on pixelBuffer: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         
@@ -432,130 +540,254 @@ class CameraService: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, Obs
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
         let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
         
-        // Sample center region (larger area for better averaging)
+        // Fast center sampling - just 13 points
         let centerX = width / 2
         let centerY = height / 2
-        let sampleRadius = 80 // Sample a 160x160 pixel area
+        let radius = 60
         
         var rTotal: Double = 0
         var gTotal: Double = 0
         var bTotal: Double = 0
-        var sampleCount = 0
+        var count = 0
         
-        // Sample points in the center region
-        for dy in stride(from: -sampleRadius, to: sampleRadius, by: 8) {
-            for dx in stride(from: -sampleRadius, to: sampleRadius, by: 8) {
-                let x = centerX + dx
-                let y = centerY + dy
-                
-                guard x >= 0, x < width, y >= 0, y < height else { continue }
-                
-                // BGRA format (most common for camera)
-                let pixelOffset = y * bytesPerRow + x * 4
-                let b = Double(buffer[pixelOffset]) / 255.0
-                let g = Double(buffer[pixelOffset + 1]) / 255.0
-                let r = Double(buffer[pixelOffset + 2]) / 255.0
-                
-                rTotal += r
-                gTotal += g
-                bTotal += b
-                sampleCount += 1
-            }
+        // Sample center point
+        let centerOffset = centerY * bytesPerRow + centerX * 4
+        rTotal += Double(buffer[centerOffset + 2])
+        gTotal += Double(buffer[centerOffset + 1])
+        bTotal += Double(buffer[centerOffset])
+        count += 3 // Weight center more
+        
+        // Sample 4 cardinal directions
+        let offsets = [(0, radius), (0, -radius), (radius, 0), (-radius, 0)]
+        for (dx, dy) in offsets {
+            let x = centerX + dx
+            let y = centerY + dy
+            guard x >= 0, x < width, y >= 0, y < height else { continue }
+            
+            let offset = y * bytesPerRow + x * 4
+            rTotal += Double(buffer[offset + 2])
+            gTotal += Double(buffer[offset + 1])
+            bTotal += Double(buffer[offset])
+            count += 1
         }
         
-        guard sampleCount > 0 else { return }
+        // Sample 4 diagonals
+        let diagRadius = 42
+        let diagOffsets = [(diagRadius, diagRadius), (diagRadius, -diagRadius),
+                          (-diagRadius, diagRadius), (-diagRadius, -diagRadius)]
+        for (dx, dy) in diagOffsets {
+            let x = centerX + dx
+            let y = centerY + dy
+            guard x >= 0, x < width, y >= 0, y < height else { continue }
+            
+            let offset = y * bytesPerRow + x * 4
+            rTotal += Double(buffer[offset + 2])
+            gTotal += Double(buffer[offset + 1])
+            bTotal += Double(buffer[offset])
+            count += 1
+        }
         
-        let avgR = rTotal / Double(sampleCount)
-        let avgG = gTotal / Double(sampleCount)
-        let avgB = bTotal / Double(sampleCount)
+        guard count > 0 else { return }
         
-        // Get color name with advanced algorithm
-        let colorName = ColorRecognizer.shared.recognizeColor(r: avgR, g: avgG, b: avgB)
+        let r = rTotal / Double(count) / 255.0
+        let g = gTotal / Double(count) / 255.0
+        let b = bTotal / Double(count) / 255.0
+        
+        let colorName = ColorRecognizer.shared.recognizeColor(r: r, g: g, b: b)
         
         DispatchQueue.main.async {
             self.dominantColor = colorName
         }
     }
+    
+    // MARK: - Vision-based Color Detection (Simplified)
+    private func performVisionColorDetection(on pixelBuffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        
+        // Extract center region only
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let centerRect = CGRect(
+            x: CGFloat(width) * 0.45,
+            y: CGFloat(height) * 0.45,
+            width: CGFloat(width) * 0.1,
+            height: CGFloat(height) * 0.1
+        )
+        let croppedImage = ciImage.cropped(to: centerRect)
+        
+        // Use CIAreaAverage for fast color extraction
+        let extent = croppedImage.extent
+        let extentVector = CIVector(x: extent.origin.x, y: extent.origin.y,
+                                   z: extent.size.width, w: extent.size.height)
+        
+        guard let filter = CIFilter(name: "CIAreaAverage",
+                                   parameters: [kCIInputImageKey: croppedImage,
+                                              kCIInputExtentKey: extentVector]),
+              let outputImage = filter.outputImage else {
+            return
+        }
+        
+        var bitmap = [UInt8](repeating: 0, count: 4)
+        let context = CIContext(options: [.workingColorSpace: kCFNull as Any,
+                                         .useSoftwareRenderer: false])
+        context.render(outputImage,
+                      toBitmap: &bitmap,
+                      rowBytes: 4,
+                      bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                      format: .RGBA8,
+                      colorSpace: nil)
+        
+        let r = Double(bitmap[0]) / 255.0
+        let g = Double(bitmap[1]) / 255.0
+        let b = Double(bitmap[2]) / 255.0
+        
+        let colorName = ColorRecognizer.shared.recognizeColor(r: r, g: g, b: b)
+        
+        DispatchQueue.main.async {
+            self.dominantColor = colorName
+        }
+    }
+    
+    // MARK: - Object Recognition (Throttled)
+    private func processObjectRecognition(pixelBuffer: CVPixelBuffer) {
+        guard let model = objectRecognitionModel else { return }
+        
+        // Run on lower priority to not block color detection
+        processingQueue.async(qos: .utility) { [weak self] in
+            guard let self = self else { return }
+            
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
+            
+            let request = VNCoreMLRequest(model: model) { [weak self] request, error in
+                guard let self = self,
+                      error == nil,
+                      let results = request.results as? [VNClassificationObservation],
+                      let topResult = results.first,
+                      topResult.confidence > 0.2 else {
+                    return
+                }
+                
+                let identifier = topResult.identifier
+                    .components(separatedBy: ",").first ?? topResult.identifier
+                    .replacingOccurrences(of: "_", with: " ")
+                    .capitalized
+                
+                let confidence = Int(topResult.confidence * 100)
+                
+                DispatchQueue.main.async {
+                    self.recognizedObject = identifier
+                    self.objectConfidence = confidence
+                }
+            }
+            
+            request.imageCropAndScaleOption = .centerCrop
+            
+            try? handler.perform([request])
+        }
+    }
 }
 
-// MARK: - Advanced Color Recognizer
+// MARK: - Advanced Color Recognizer with Temporal Smoothing
 class ColorRecognizer {
     static let shared = ColorRecognizer()
     
-    // Adaptive white balance reference (updated over time)
-    private var whiteBalanceR: Double = 1.0
-    private var whiteBalanceG: Double = 1.0
-    private var whiteBalanceB: Double = 1.0
-    private var sampleHistory: [(r: Double, g: Double, b: Double)] = []
-    private let maxHistorySize = 30
+    // Temporal smoothing for stable color detection
+    private var colorHistory: [String] = []
+    private let historySize = 5
+    
+    // Auto white balance with better adaptation
+    private var referenceWhite = (r: 1.0, g: 1.0, b: 1.0)
+    private var calibrationSamples: [(r: Double, g: Double, b: Double)] = []
+    private let maxCalibrationSamples = 60
+    
+    // Color cache for performance
+    private var lastColor: String = "Unknown"
+    private var colorStability = 0
     
     func recognizeColor(r: Double, g: Double, b: Double) -> String {
-        // Update sample history for adaptive white balance
-        updateSampleHistory(r: r, g: g, b: b)
+        // Auto white balance calibration
+        updateWhiteBalance(r: r, g: g, b: b)
         
-        // Apply white balance correction
-        let (corrR, corrG, corrB) = applyWhiteBalance(r: r, g: g, b: b)
+        // Apply auto white balance
+        let (balR, balG, balB) = applyAutoWhiteBalance(r: r, g: g, b: b)
         
-        // Convert to HSL
-        let (hue, saturation, lightness) = rgbToHSL(r: corrR, g: corrG, b: corrB)
+        // Gamma correction for better perception
+        let (gammaR, gammaG, gammaB) = applyGammaCorrection(r: balR, g: balG, b: balB)
         
-        // Also calculate chroma for better detection
-        let maxRGB = max(corrR, corrG, corrB)
-        let minRGB = min(corrR, corrG, corrB)
+        // Convert to multiple color spaces for robust detection
+        let (hue, sat, light) = rgbToHSL(r: gammaR, g: gammaG, b: gammaB)
+        let (L, a, bComp) = rgbToLAB(r: gammaR, g: gammaG, b: gammaB)
+        
+        // Calculate chroma and other perceptual metrics
+        let maxRGB = max(gammaR, gammaG, gammaB)
+        let minRGB = min(gammaR, gammaG, gammaB)
         let chroma = maxRGB - minRGB
         
-        // Convert to degrees and percentages
-        let h = hue * 360
-        let s = saturation * 100
-        let l = lightness * 100
+        // Classify the color
+        let detectedColor: String
         
-        // Detect grayscale - use chroma and saturation together
-        let isNeutral = chroma < 0.12 && s < 15
+        // Detect neutral colors (grays) using multiple criteria
+        let isNeutral = (chroma < 0.08 && sat < 12) || 
+                       (abs(a) < 8 && abs(bComp) < 8 && L > 20) ||
+                       (sat < 8)
         
         if isNeutral {
-            return classifyGrayscale(lightness: l)
+            detectedColor = classifyNeutral(L: L, lightness: light)
+        } else {
+            detectedColor = classifyChromatic(h: hue * 360, s: sat * 100, l: light * 100, 
+                                            L: L, a: a, b: bComp, chroma: chroma)
         }
         
-        // Classify chromatic colors
-        return classifyChromatic(hue: h, saturation: s, lightness: l, chroma: chroma)
+        // Apply temporal smoothing for stability
+        return applyTemporalSmoothing(color: detectedColor)
     }
     
-    private func updateSampleHistory(r: Double, g: Double, b: Double) {
-        sampleHistory.append((r: r, g: g, b: b))
-        if sampleHistory.count > maxHistorySize {
-            sampleHistory.removeFirst()
+    // MARK: - White Balance
+    private func updateWhiteBalance(r: Double, g: Double, b: Double) {
+        calibrationSamples.append((r: r, g: g, b: b))
+        if calibrationSamples.count > maxCalibrationSamples {
+            calibrationSamples.removeFirst(10)
         }
         
-        // Update white balance based on history (gray world assumption)
-        if sampleHistory.count >= 10 {
-            let avgR = sampleHistory.map { $0.r }.reduce(0, +) / Double(sampleHistory.count)
-            let avgG = sampleHistory.map { $0.g }.reduce(0, +) / Double(sampleHistory.count)
-            let avgB = sampleHistory.map { $0.b }.reduce(0, +) / Double(sampleHistory.count)
+        // Update white balance reference using gray world assumption
+        if calibrationSamples.count >= 30 {
+            let avgR = calibrationSamples.map { $0.r }.reduce(0, +) / Double(calibrationSamples.count)
+            let avgG = calibrationSamples.map { $0.g }.reduce(0, +) / Double(calibrationSamples.count)
+            let avgB = calibrationSamples.map { $0.b }.reduce(0, +) / Double(calibrationSamples.count)
             
             let grayTarget = (avgR + avgG + avgB) / 3.0
             
-            if grayTarget > 0.05 {
-                // Smoothly adjust white balance
-                let smoothing = 0.1
-                whiteBalanceR = whiteBalanceR * (1 - smoothing) + (grayTarget / max(avgR, 0.01)) * smoothing
-                whiteBalanceG = whiteBalanceG * (1 - smoothing) + (grayTarget / max(avgG, 0.01)) * smoothing
-                whiteBalanceB = whiteBalanceB * (1 - smoothing) + (grayTarget / max(avgB, 0.01)) * smoothing
+            if grayTarget > 0.1 {
+                let smoothing = 0.05 // Slow adaptation
+                referenceWhite.r = referenceWhite.r * (1 - smoothing) + (grayTarget / max(avgR, 0.01)) * smoothing
+                referenceWhite.g = referenceWhite.g * (1 - smoothing) + (grayTarget / max(avgG, 0.01)) * smoothing
+                referenceWhite.b = referenceWhite.b * (1 - smoothing) + (grayTarget / max(avgB, 0.01)) * smoothing
                 
                 // Clamp to reasonable range
-                whiteBalanceR = max(0.5, min(2.0, whiteBalanceR))
-                whiteBalanceG = max(0.5, min(2.0, whiteBalanceG))
-                whiteBalanceB = max(0.5, min(2.0, whiteBalanceB))
+                referenceWhite.r = max(0.7, min(1.5, referenceWhite.r))
+                referenceWhite.g = max(0.7, min(1.5, referenceWhite.g))
+                referenceWhite.b = max(0.7, min(1.5, referenceWhite.b))
             }
         }
     }
     
-    private func applyWhiteBalance(r: Double, g: Double, b: Double) -> (Double, Double, Double) {
-        let corrR = min(1.0, r * whiteBalanceR)
-        let corrG = min(1.0, g * whiteBalanceG)
-        let corrB = min(1.0, b * whiteBalanceB)
+    private func applyAutoWhiteBalance(r: Double, g: Double, b: Double) -> (Double, Double, Double) {
+        let balR = min(1.0, r * referenceWhite.r)
+        let balG = min(1.0, g * referenceWhite.g)
+        let balB = min(1.0, b * referenceWhite.b)
+        return (balR, balG, balB)
+    }
+    
+    // MARK: - Gamma Correction
+    private func applyGammaCorrection(r: Double, g: Double, b: Double, gamma: Double = 2.2) -> (Double, Double, Double) {
+        let corrR = pow(r, 1.0 / gamma)
+        let corrG = pow(g, 1.0 / gamma)
+        let corrB = pow(b, 1.0 / gamma)
         return (corrR, corrG, corrB)
     }
     
+    // MARK: - Color Space Conversions
     private func rgbToHSL(r: Double, g: Double, b: Double) -> (h: Double, s: Double, l: Double) {
         let maxC = max(r, g, b)
         let minC = min(r, g, b)
@@ -585,202 +817,263 @@ class ColorRecognizer {
         return (h, s, l)
     }
     
-    private func classifyGrayscale(lightness: Double) -> String {
-        if lightness > 92 { return "White" }
-        if lightness > 78 { return "Off-White" }
-        if lightness > 65 { return "Light Gray" }
-        if lightness > 45 { return "Gray" }
-        if lightness > 28 { return "Dark Gray" }
-        if lightness > 12 { return "Charcoal" }
+    // Convert RGB to LAB color space for perceptually uniform color detection
+    private func rgbToLAB(r: Double, g: Double, b: Double) -> (L: Double, a: Double, b: Double) {
+        // First convert to XYZ
+        var rLin = r > 0.04045 ? pow((r + 0.055) / 1.055, 2.4) : r / 12.92
+        var gLin = g > 0.04045 ? pow((g + 0.055) / 1.055, 2.4) : g / 12.92
+        var bLin = b > 0.04045 ? pow((b + 0.055) / 1.055, 2.4) : b / 12.92
+        
+        rLin *= 100
+        gLin *= 100
+        bLin *= 100
+        
+        // Observer = 2°, Illuminant = D65
+        var X = rLin * 0.4124564 + gLin * 0.3575761 + bLin * 0.1804375
+        var Y = rLin * 0.2126729 + gLin * 0.7151522 + bLin * 0.0721750
+        var Z = rLin * 0.0193339 + gLin * 0.1191920 + bLin * 0.9503041
+        
+        // D65 reference white point
+        X /= 95.047
+        Y /= 100.000
+        Z /= 108.883
+        
+        // Convert to LAB
+        X = X > 0.008856 ? pow(X, 1.0/3.0) : (7.787 * X) + (16.0 / 116.0)
+        Y = Y > 0.008856 ? pow(Y, 1.0/3.0) : (7.787 * Y) + (16.0 / 116.0)
+        Z = Z > 0.008856 ? pow(Z, 1.0/3.0) : (7.787 * Z) + (16.0 / 116.0)
+        
+        let L = max(0, (116.0 * Y) - 16.0)
+        let a = 500.0 * (X - Y)
+        let bValue = 200.0 * (Y - Z)
+        
+        return (L, a, bValue)
+    }
+    
+    // MARK: - Temporal Smoothing
+    private func applyTemporalSmoothing(color: String) -> String {
+        colorHistory.append(color)
+        if colorHistory.count > historySize {
+            colorHistory.removeFirst()
+        }
+        
+        // Return most common color in history for stability
+        if colorHistory.count >= 3 {
+            let colorCounts = colorHistory.reduce(into: [:]) { counts, color in
+                counts[color, default: 0] += 1
+            }
+            
+            if let mostCommon = colorCounts.max(by: { $0.value < $1.value }) {
+                if mostCommon.value >= 2 || colorHistory.count >= historySize {
+                    return mostCommon.key
+                }
+            }
+        }
+        
+        return color
+    }
+    
+    // MARK: - Color Classification
+    private func classifyNeutral(L: Double, lightness: Double) -> String {
+        // Use LAB lightness for more accurate perception
+        if L > 95 { return "White" }
+        if L > 85 { return "Off-White" }
+        if L > 70 { return "Light Gray" }
+        if L > 50 { return "Gray" }
+        if L > 30 { return "Dark Gray" }
+        if L > 15 { return "Charcoal" }
         return "Black"
     }
     
-    private func classifyChromatic(hue: Double, saturation: Double, lightness: Double, chroma: Double) -> String {
-        // Lightness classifications
-        let isVeryLight = lightness > 80
-        let isLight = lightness > 62
-        let isMediumLight = lightness > 45
-        let isMedium = lightness > 32
-        let isDark = lightness < 32
-        let isVeryDark = lightness < 20
+    private func classifyChromatic(h: Double, s: Double, l: Double, 
+                                   L: Double, a: Double, b: Double, chroma: Double) -> String {
+        // Use both HSL and LAB for robust classification
+        // LAB a: green(-) to red(+)
+        // LAB b: blue(-) to yellow(+)
         
-        // Saturation classifications
-        let isVeryPale = saturation < 20
-        let isPale = saturation < 35
-        let isMuted = saturation < 50
-        let isVivid = saturation > 70
-        let isVeryVivid = saturation > 85
+        // Classify by lightness groups for better naming
+        let veryLight = L > 80
+        let light = L > 62
+        let medium = L > 40
+        let dark = L < 35
+        let veryDark = L < 20
         
-        // Hue-based classification with detailed ranges
+        // Classify by saturation
+        let veryPale = s < 18
+        let pale = s < 32
+        let muted = s < 48
+        let vivid = s > 72
+        let veryVivid = s > 88
         
-        // RED (345-360, 0-10)
-        if hue >= 345 || hue < 10 {
-            if isVeryLight && isVeryPale { return "White-Pink" }
-            if isVeryLight { return "Light Pink" }
-            if isLight && isPale { return "Rose" }
-            if isLight && isMuted { return "Salmon" }
-            if isLight { return "Coral" }
-            if isVeryDark { return "Dark Red" }
-            if isDark && isMuted { return "Maroon" }
-            if isDark { return "Burgundy" }
-            if isVeryVivid { return "Bright Red" }
-            if isVivid { return "Red" }
-            if isMuted { return "Brick Red" }
+        // Use hue for basic color determination with refined ranges
+        var baseColor = ""
+        
+        // RED (345-360, 0-15)
+        if h >= 345 || h < 15 {
+            if veryLight && veryPale { return "Pale Pink" }
+            if veryLight && pale { return "Light Pink" }
+            if veryLight { return "Pink" }
+            if light && pale { return "Rose" }
+            if light && muted { return "Salmon" }
+            if light { return "Coral" }
+            if veryDark { return "Dark Red" }
+            if dark && pale { return "Maroon" }
+            if dark { return "Burgundy" }
+            if veryVivid { return "Bright Red" }
+            if vivid { return "Red" }
+            if muted { return "Brick Red" }
             return "Red"
         }
         
-        // RED-ORANGE (10-25)
-        if hue < 25 {
-            if isVeryDark { return "Brown" }
-            if isDark { return "Dark Brown" }
-            if isVeryLight && isPale { return "Peach" }
-            if isVeryLight { return "Light Coral" }
-            if isLight { return "Coral" }
-            if isMuted { return "Rust" }
+        // RED-ORANGE (15-28)
+        if h < 28 {
+            if veryDark || (dark && s < 40) { return "Brown" }
+            if veryLight && pale { return "Peach" }
+            if veryLight { return "Light Coral" }
+            if light { return "Coral" }
+            if muted && medium { return "Terracotta" }
             return "Red-Orange"
         }
         
-        // ORANGE (25-42)
-        if hue < 42 {
-            if isVeryDark { return "Dark Brown" }
-            if isDark && isMuted { return "Brown" }
-            if isDark { return "Burnt Orange" }
-            if isVeryLight && isVeryPale { return "Cream" }
-            if isVeryLight { return "Peach" }
-            if isLight && isPale { return "Apricot" }
-            if isLight { return "Light Orange" }
-            if isPale { return "Tan" }
-            if isVeryVivid { return "Bright Orange" }
+        // ORANGE (28-45)
+        if h < 45 {
+            if veryDark { return "Dark Brown" }
+            if dark && s < 50 { return "Brown" }
+            if dark { return "Burnt Orange" }
+            if veryLight && veryPale { return "Cream" }
+            if veryLight && pale { return "Peach" }
+            if veryLight { return "Light Orange" }
+            if light && pale { return "Apricot" }
+            if pale && medium { return "Tan" }
+            if veryVivid { return "Bright Orange" }
+            if vivid { return "Orange" }
             return "Orange"
         }
         
-        // GOLD/YELLOW-ORANGE (42-52)
-        if hue < 52 {
-            if isVeryDark { return "Brown" }
-            if isDark { return "Olive Brown" }
-            if isVeryLight && isPale { return "Cream" }
-            if isVeryLight { return "Light Gold" }
-            if isPale { return "Khaki" }
-            if isVivid { return "Gold" }
-            return "Golden Yellow"
+        // GOLD/AMBER (45-55)
+        if h < 55 {
+            if veryDark { return "Olive Brown" }
+            if dark { return "Dark Mustard" }
+            if veryLight && pale { return "Cream" }
+            if veryLight { return "Light Gold" }
+            if pale { return "Khaki" }
+            if vivid { return "Gold" }
+            return "Amber"
         }
         
-        // YELLOW (52-68)
-        if hue < 68 {
-            if isVeryDark { return "Olive" }
-            if isDark { return "Dark Olive" }
-            if isVeryLight && isVeryPale { return "Ivory" }
-            if isVeryLight { return "Light Yellow" }
-            if isPale && isLight { return "Cream" }
-            if isPale { return "Beige" }
-            if isVeryVivid { return "Bright Yellow" }
-            if isVivid { return "Yellow" }
-            if isMuted { return "Mustard" }
+        // YELLOW (55-70)
+        if h < 70 {
+            if veryDark { return "Dark Olive" }
+            if dark { return "Olive" }
+            if veryLight && veryPale { return "Ivory" }
+            if veryLight { return "Light Yellow" }
+            if light && pale { return "Cream" }
+            if pale { return "Beige" }
+            if veryVivid { return "Bright Yellow" }
+            if vivid || s > 60 { return "Yellow" }
+            if muted { return "Mustard" }
             return "Yellow"
         }
         
-        // YELLOW-GREEN (68-85)
-        if hue < 85 {
-            if isVeryDark { return "Dark Olive" }
-            if isDark { return "Olive" }
-            if isVeryLight { return "Light Lime" }
-            if isPale { return "Pale Green" }
-            if isVivid { return "Lime" }
+        // YELLOW-GREEN/LIME (70-88)
+        if h < 88 {
+            if veryDark { return "Dark Olive" }
+            if dark { return "Olive" }
+            if veryLight { return "Light Lime" }
+            if light && pale { return "Pale Green" }
+            if vivid { return "Lime" }
             return "Yellow-Green"
         }
         
-        // GREEN (85-155)
-        if hue < 155 {
-            if isVeryLight && isVeryPale { return "Mint" }
-            if isVeryLight && isPale { return "Pale Mint" }
-            if isVeryLight { return "Light Green" }
-            if isLight && isPale { return "Sage" }
-            if isLight { return "Spring Green" }
-            if isVeryDark { return "Dark Green" }
-            if isDark && isMuted { return "Forest Green" }
-            if isDark { return "Hunter Green" }
-            if isVeryVivid { return "Bright Green" }
-            if isVivid { return "Green" }
-            if isMuted { return "Olive Green" }
-            if hue > 140 && isMedium { return "Teal Green" }
+        // GREEN (88-160)
+        if h < 160 {
+            if veryLight && veryPale { return "Mint" }
+            if veryLight && pale { return "Pale Mint" }
+            if veryLight { return "Light Green" }
+            if light && pale { return "Sage" }
+            if light && h > 145 { return "Seafoam" }
+            if light { return "Spring Green" }
+            if veryDark { return "Dark Green" }
+            if dark && muted { return "Forest Green" }
+            if dark && h > 145 { return "Dark Teal" }
+            if dark { return "Hunter Green" }
+            if veryVivid { return "Bright Green" }
+            if vivid { return "Green" }
+            if h > 145 && medium { return "Teal" }
+            if muted { return "Olive Green" }
             return "Green"
         }
         
-        // CYAN-GREEN (155-175)
-        if hue < 175 {
-            if isVeryLight { return "Aqua" }
-            if isLight { return "Seafoam" }
-            if isDark { return "Dark Teal" }
-            if isVivid { return "Turquoise" }
-            return "Teal"
-        }
-        
-        // CYAN (175-195)
-        if hue < 195 {
-            if isVeryLight { return "Light Cyan" }
-            if isLight { return "Sky Blue" }
-            if isDark { return "Dark Cyan" }
-            if isVeryVivid { return "Bright Cyan" }
+        // CYAN/TURQUOISE (160-190)
+        if h < 190 {
+            if veryLight && pale { return "Pale Aqua" }
+            if veryLight { return "Light Cyan" }
+            if light { return "Aqua" }
+            if dark { return "Dark Teal" }
+            if vivid { return "Turquoise" }
             return "Cyan"
         }
         
-        // LIGHT BLUE (195-215)
-        if hue < 215 {
-            if isVeryLight && isVeryPale { return "Ice Blue" }
-            if isVeryLight { return "Powder Blue" }
-            if isLight { return "Sky Blue" }
-            if isDark { return "Steel Blue" }
+        // LIGHT BLUE (190-220)
+        if h < 220 {
+            if veryLight && veryPale { return "Ice Blue" }
+            if veryLight { return "Powder Blue" }
+            if light && pale { return "Sky Blue" }
+            if light { return "Light Blue" }
+            if dark { return "Steel Blue" }
+            if vivid { return "Sky Blue" }
             return "Light Blue"
         }
         
-        // BLUE (215-250)
-        if hue < 250 {
-            if isVeryLight && isVeryPale { return "Periwinkle" }
-            if isVeryLight { return "Light Blue" }
-            if isLight && isPale { return "Cornflower Blue" }
-            if isLight { return "Medium Blue" }
-            if isVeryDark { return "Navy" }
-            if isDark { return "Dark Blue" }
-            if isVeryVivid { return "Bright Blue" }
-            if isVivid { return "Blue" }
-            if isMuted { return "Slate Blue" }
+        // BLUE (220-255)
+        if h < 255 {
+            if veryLight && veryPale { return "Periwinkle" }
+            if veryLight { return "Light Blue" }
+            if light && pale { return "Cornflower" }
+            if light { return "Medium Blue" }
+            if veryDark { return "Navy" }
+            if dark { return "Dark Blue" }
+            if veryVivid { return "Bright Blue" }
+            if vivid { return "Blue" }
+            if muted { return "Slate Blue" }
             return "Blue"
         }
         
-        // BLUE-PURPLE (250-275)
-        if hue < 275 {
-            if isVeryLight { return "Lavender" }
-            if isLight { return "Periwinkle" }
-            if isDark { return "Indigo" }
-            if isVivid { return "Violet" }
+        // INDIGO/VIOLET (255-280)
+        if h < 280 {
+            if veryLight { return "Lavender" }
+            if light { return "Periwinkle" }
+            if veryDark { return "Deep Indigo" }
+            if dark { return "Indigo" }
+            if vivid { return "Violet" }
             return "Blue-Violet"
         }
         
-        // PURPLE (275-310)
-        if hue < 310 {
-            if isVeryLight && isVeryPale { return "Pale Lavender" }
-            if isVeryLight { return "Light Purple" }
-            if isLight && isPale { return "Lilac" }
-            if isLight { return "Orchid" }
-            if isVeryDark { return "Dark Purple" }
-            if isDark { return "Plum" }
-            if isVeryVivid { return "Bright Purple" }
-            if isVivid { return "Purple" }
-            if isMuted { return "Mauve" }
+        // PURPLE (280-315)
+        if h < 315 {
+            if veryLight && veryPale { return "Pale Lavender" }
+            if veryLight { return "Light Purple" }
+            if light && pale { return "Lilac" }
+            if light { return "Orchid" }
+            if veryDark { return "Deep Purple" }
+            if dark { return "Plum" }
+            if veryVivid { return "Bright Purple" }
+            if vivid { return "Purple" }
+            if muted { return "Mauve" }
             return "Purple"
         }
         
-        // MAGENTA/PINK (310-345)
-        if hue < 345 {
-            if isVeryLight && isVeryPale { return "Blush" }
-            if isVeryLight { return "Light Pink" }
-            if isLight && isPale { return "Rose Pink" }
-            if isLight { return "Pink" }
-            if isDark && isMuted { return "Plum" }
-            if isDark { return "Magenta" }
-            if isVeryVivid { return "Hot Pink" }
-            if isVivid { return "Fuchsia" }
-            if isMuted { return "Dusty Rose" }
+        // MAGENTA/PINK (315-345)
+        if h < 345 {
+            if veryLight && veryPale { return "Blush" }
+            if veryLight { return "Light Pink" }
+            if light && pale { return "Rose Pink" }
+            if light { return "Pink" }
+            if dark && muted { return "Plum" }
+            if dark { return "Deep Magenta" }
+            if veryVivid { return "Hot Pink" }
+            if vivid { return "Fuchsia" }
+            if muted { return "Dusty Rose" }
             return "Magenta"
         }
         

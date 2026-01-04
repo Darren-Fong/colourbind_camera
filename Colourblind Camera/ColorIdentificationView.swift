@@ -140,9 +140,7 @@ struct ColorIdentificationView: View {
         }
         .onDisappear {
             stopColorTracking()
-            DispatchQueue.global(qos: .userInitiated).async {
-                cameraService.session?.stopRunning()
-            }
+            cameraService.stopSession()
         }
     }
     
